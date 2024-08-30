@@ -47,14 +47,14 @@ use crate::plugin::PluginInit;
 use crate::plugins::rhai::engine::OptionDance;
 use crate::register_plugin;
 
-mod engine;
+pub mod engine;
 
 pub(crate) const RHAI_SPAN_NAME: &str = "rhai_plugin";
 
-mod execution;
-mod router;
-mod subgraph;
-mod supergraph;
+pub mod execution;
+pub mod router;
+pub mod subgraph;
+pub mod supergraph;
 
 struct EngineBlock {
     ast: AST,

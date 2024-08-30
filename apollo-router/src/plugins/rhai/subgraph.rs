@@ -6,7 +6,7 @@ use tower::BoxError;
 
 use super::ErrorDetails;
 use crate::graphql::Error;
-pub(crate) use crate::services::subgraph::*;
+pub use crate::services::subgraph::*;
 use crate::Context;
 
 pub(super) fn request_failure(

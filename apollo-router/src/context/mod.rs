@@ -64,7 +64,7 @@ pub struct Context {
     busy_timer: Arc<Mutex<BusyTimer>>,
 
     #[serde(skip)]
-    pub(crate) id: String,
+    pub id: String,
 }
 
 impl Context {

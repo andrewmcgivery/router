@@ -6,13 +6,13 @@ use tower::BoxError;
 
 use super::ErrorDetails;
 use crate::graphql::Error;
-pub(crate) use crate::services::router::*;
+pub use crate::services::router::*;
 use crate::Context;
 
-pub(crate) type FirstRequest = super::engine::RhaiRouterFirstRequest;
-pub(crate) type ChunkedRequest = super::engine::RhaiRouterChunkedRequest;
-pub(crate) type FirstResponse = super::engine::RhaiRouterResponse;
-pub(crate) type DeferredResponse = super::engine::RhaiRouterChunkedResponse;
+pub type FirstRequest = super::engine::RhaiRouterFirstRequest;
+pub type ChunkedRequest = super::engine::RhaiRouterChunkedRequest;
+pub type FirstResponse = super::engine::RhaiRouterResponse;
+pub type DeferredResponse = super::engine::RhaiRouterChunkedResponse;
 
 pub(super) fn request_failure(
     context: Context,

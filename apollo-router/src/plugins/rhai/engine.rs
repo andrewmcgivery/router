@@ -58,7 +58,7 @@ const CANNOT_ACCESS_STATUS_CODE_ON_A_DEFERRED_RESPONSE: &str =
 
 const CANNOT_GET_ENVIRONMENT_VARIABLE: &str = "environment variable not found";
 
-pub(super) trait OptionDance<T> {
+pub trait OptionDance<T> {
     fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R;
 
     fn replace(&self, f: impl FnOnce(T) -> T);
@@ -66,7 +66,7 @@ pub(super) trait OptionDance<T> {
     fn take_unwrap(self) -> T;
 }
 
-pub(super) type SharedMut<T> = rhai::Shared<Mutex<Option<T>>>;
+pub type SharedMut<T> = rhai::Shared<Mutex<Option<T>>>;
 
 impl<T> OptionDance<T> for SharedMut<T> {
     fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
@@ -113,7 +113,7 @@ fn get_engine(alphabet: &Base64Alphabet) -> base64::engine::GeneralPurpose {
 // error[E0658]: non-inline modules in proc macro input are unstable
 #[export_module]
 #[allow(unreachable_pub)]
-mod router_base64 {
+pub mod router_base64 {
     pub type Alphabet = Base64Alphabet;
     pub const STANDARD: Alphabet = Alphabet::Standard;
     pub const STANDARD_NO_PAD: Alphabet = Alphabet::StandardNoPad;
@@ -153,7 +153,7 @@ mod router_base64 {
 }
 
 #[export_module]
-mod router_json {
+pub mod router_json {
     pub(crate) type Object = crate::json_ext::Object;
     pub(crate) type Value = crate::json_ext::Value;
 
@@ -179,7 +179,7 @@ mod router_json {
 }
 
 #[export_module]
-mod router_sha256 {
+pub mod router_sha256 {
     use sha2::Digest;
 
     #[rhai_fn(pure)]
@@ -190,7 +190,7 @@ mod router_sha256 {
 }
 
 #[export_module]
-mod router_expansion {
+pub mod router_expansion {
     pub(crate) type Expansion = expansion::Expansion;
 
     #[rhai_fn(name = "get", return_raw)]
@@ -204,7 +204,7 @@ mod router_expansion {
 }
 
 #[export_module]
-mod router_method {
+pub mod router_method {
     pub(crate) type Method = http::Method;
 
     #[rhai_fn(name = "to_string", pure)]
@@ -224,7 +224,7 @@ mod router_method {
 }
 
 #[export_module]
-mod status_code {
+pub mod status_code {
     use rhai::INT;
 
     pub(crate) type StatusCode = http::StatusCode;
@@ -258,7 +258,7 @@ mod status_code {
 }
 
 #[export_module]
-mod router_header_map {
+pub mod router_header_map {
     pub(crate) type HeaderMap = http::HeaderMap;
     pub(crate) type OptionalHeaderName = Option<http::header::HeaderName>;
     pub(crate) type HeaderName = http::header::HeaderName;
@@ -416,7 +416,7 @@ mod router_header_map {
 }
 
 #[export_module]
-mod router_context {
+pub mod router_context {
     pub(crate) type Context = crate::Context;
 
     // Register a contains function for Context so that "in" works
@@ -607,7 +607,7 @@ mod router_context {
 // We have to keep the modules that we export using `export_module` inline because
 // error[E0658]: non-inline modules in proc macro input are unstable
 #[export_module]
-mod router_plugin {
+pub mod router_plugin {
     pub(crate) type HeaderMap = http::HeaderMap;
     pub(crate) type Request = crate::graphql::Request;
     pub(crate) type Response = crate::graphql::Response;
@@ -1276,55 +1276,56 @@ mod router_plugin {
 }
 
 #[derive(Default)]
-pub(crate) struct RhaiRouterFirstRequest {
-    pub(crate) context: Context,
-    pub(crate) request: http::Request<()>,
+pub struct RhaiRouterFirstRequest {
+    pub context: Context,
+    pub request: http::Request<()>,
 }
 
 #[allow(dead_code)]
 #[derive(Default)]
-pub(crate) struct RhaiRouterChunkedRequest {
-    pub(crate) context: Context,
-    pub(crate) request: Bytes,
+pub struct RhaiRouterChunkedRequest {
+    pub context: Context,
+    pub request: Bytes,
 }
 
 #[derive(Default)]
-pub(crate) struct RhaiRouterResponse {
-    pub(crate) context: Context,
-    pub(crate) response: http::Response<()>,
+pub struct RhaiRouterResponse {
+    pub context: Context,
+    pub response: http::Response<()>,
 }
 
 #[allow(dead_code)]
 #[derive(Default)]
-pub(crate) struct RhaiRouterChunkedResponse {
-    pub(crate) context: Context,
-    pub(crate) response: Bytes,
+pub struct RhaiRouterChunkedResponse {
+    pub context: Context,
+    pub response: Bytes,
 }
 
 #[derive(Default)]
-pub(crate) struct RhaiSupergraphResponse {
-    pub(crate) context: Context,
-    pub(crate) response: http_ext::Response<Response>,
+pub struct RhaiSupergraphResponse {
+    pub context: Context,
+    pub response: http_ext::Response<Response>,
 }
 
 #[derive(Default)]
-pub(crate) struct RhaiSupergraphDeferredResponse {
-    pub(crate) context: Context,
-    pub(crate) response: Response,
+pub struct RhaiSupergraphDeferredResponse {
+    pub context: Context,
+    pub response: Response,
 }
 
 #[derive(Default)]
-pub(crate) struct RhaiExecutionResponse {
-    pub(crate) context: Context,
-    pub(crate) response: http_ext::Response<Response>,
+pub struct RhaiExecutionResponse {
+    pub context: Context,
+    pub response: http_ext::Response<Response>,
 }
 
 #[derive(Default)]
-pub(crate) struct RhaiExecutionDeferredResponse {
-    pub(crate) context: Context,
-    pub(crate) response: Response,
+pub struct RhaiExecutionDeferredResponse {
+    pub context: Context,
+    pub response: Response,
 }
 
+#[macro_export]
 macro_rules! if_subgraph {
     ( subgraph => $subgraph: block else $not_subgraph: block ) => {
         $subgraph
@@ -1334,6 +1335,7 @@ macro_rules! if_subgraph {
     };
 }
 
+#[macro_export]
 macro_rules! register_rhai_router_interface {
     ($engine: ident, $($base: ident), *) => {
         $(
@@ -1505,6 +1507,7 @@ macro_rules! register_rhai_router_interface {
     };
 }
 
+#[macro_export]
 macro_rules! register_rhai_interface {
     ($engine: ident, $($base: ident), *) => {
         $(

@@ -6,11 +6,11 @@ use tower::BoxError;
 
 use super::ErrorDetails;
 use crate::graphql::Error;
-pub(crate) use crate::services::execution::*;
+pub use crate::services::execution::*;
 use crate::Context;
 
-pub(crate) type FirstResponse = super::engine::RhaiExecutionResponse;
-pub(crate) type DeferredResponse = super::engine::RhaiExecutionDeferredResponse;
+pub type FirstResponse = super::engine::RhaiExecutionResponse;
+pub type DeferredResponse = super::engine::RhaiExecutionDeferredResponse;
 
 pub(super) fn request_failure(
     context: Context,
