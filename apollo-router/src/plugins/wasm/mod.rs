@@ -1,10 +1,13 @@
+use crate::error::Error;
 use crate::layers::async_checkpoint::OneShotAsyncCheckpointLayer;
 use crate::plugin::Plugin;
 use crate::plugin::PluginInit;
 use crate::register_plugin;
+use crate::services::external::PipelineStep;
 use crate::services::router;
 use arc_swap::ArcSwap;
 use extism::*;
+use http::StatusCode;
 use notify::event::DataChange;
 use notify::event::MetadataKind;
 use notify::event::ModifyKind;
@@ -15,9 +18,9 @@ use notify::RecursiveMode;
 use notify::Watcher;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::json;
 use serde_json::to_string;
-use std::error::Error;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::atomic::Ordering;
@@ -31,6 +34,33 @@ use tower::util::MapFutureLayer;
 use tower::BoxError;
 use tower::ServiceBuilder;
 use tower::ServiceExt;
+
+const EXTERNALIZABLE_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum Control {
+    #[default]
+    Continue,
+    Break(u16),
+}
+
+impl Control {
+    pub(crate) fn get_http_status(&self) -> Result<StatusCode, BoxError> {
+        match self {
+            Control::Continue => Ok(StatusCode::OK),
+            Control::Break(code) => StatusCode::from_u16(*code).map_err(|e| e.into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RouterExtensionPayload {
+    version: u8,
+    stage: String,
+    control: Control,
+    id: String,
+}
 
 struct WasmEngine {
     plugin: extism::Plugin,
@@ -187,9 +217,10 @@ impl Plugin for Wasm {
                         let plugin = &mut locked_instance.plugin;
 
                         let payload = json!({
-                            "version": "1",
-                            "stage": "RouterRequest",
-                            "control": "Continue"
+                            "version": EXTERNALIZABLE_VERSION,
+                            "stage": PipelineStep::RouterRequest,
+                            "control": Control::default(),
+                            "id": request.context.id.clone()
                         });
                         let payload_string = to_string(&payload).unwrap();
 
@@ -201,6 +232,37 @@ impl Plugin for Wasm {
                             function_result
                         );
 
+                        let returned_payload: RouterExtensionPayload =
+                            serde_json::from_str(function_result)?;
+                        let control = returned_payload.control;
+
+                        if matches!(control, Control::Break(_)) {
+                            let code = control.get_http_status()?;
+
+                            let graphql_response: crate::graphql::Response =
+                                crate::graphql::Response::builder()
+                                    .errors(vec![Error::builder()
+                                        .message("We broke!")
+                                        .extension_code("WE_BROKE")
+                                        .build()])
+                                    .build();
+
+                            let res = router::Response::builder()
+                                .errors(graphql_response.errors)
+                                .extensions(graphql_response.extensions)
+                                .status_code(code)
+                                .context(request.context);
+
+                            let mut res = match (graphql_response.label, graphql_response.data) {
+                                (Some(label), Some(data)) => res.label(label).data(data).build()?,
+                                (Some(label), None) => res.label(label).build()?,
+                                (None, Some(data)) => res.data(data).build()?,
+                                (None, None) => res.build()?,
+                            };
+
+                            return Ok(ControlFlow::Break(res));
+                        }
+
                         let result = Ok(ControlFlow::Continue(request));
                         result
                     }
@@ -211,8 +273,12 @@ impl Plugin for Wasm {
         let response_layer = Some(MapFutureLayer::new(
             move |fut: std::pin::Pin<
                 Box<
-                    dyn Future<Output = Result<router::Response, Box<dyn Error + Send + Sync>>>
-                        + Send,
+                    dyn Future<
+                            Output = Result<
+                                router::Response,
+                                Box<dyn std::error::Error + Send + Sync>,
+                            >,
+                        > + Send,
                 >,
             >| async {
                 let response: router::Response = fut.await?;
