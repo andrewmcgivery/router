@@ -274,6 +274,7 @@ itoa = "1.0.9"
 ryu = "1.0.15"
 wasmtime = "25.0.1"
 wasi-common = "25.0.2"
+extism = "1.7.0"
 
 [target.'cfg(macos)'.dependencies]
 uname = "0.1.1"

@@ -4,7 +4,6 @@ use crate::plugin::PluginInit;
 use crate::register_plugin;
 use crate::services::router;
 use arc_swap::ArcSwap;
-use extism::*;
 use notify::event::DataChange;
 use notify::event::MetadataKind;
 use notify::event::ModifyKind;
@@ -31,26 +30,148 @@ use tower::util::MapFutureLayer;
 use tower::BoxError;
 use tower::ServiceBuilder;
 use tower::ServiceExt;
+use wasi_common::sync::WasiCtxBuilder;
+use wasi_common::WasiCtx;
+use wasmtime::*;
 
 struct WasmEngine {
-    plugin: extism::Plugin,
+    engine: Engine,
+    store: Store<WasiCtx>,
+    instance: Instance,
+    linker: Linker<WasiCtx>,
 }
 
+fn read_string(data: &[u8], ptr: usize) -> String {
+    let mut end = ptr;
+    while end < data.len() && data[end] != 0 {
+        end += 1;
+    }
+    String::from_utf8_lossy(&data[ptr..end]).into_owned()
+}
+
+fn get_string_from_caller(caller: &mut Caller<'_, WasiCtx>, ptr: i32) -> String {
+    let memory = caller
+        .get_export("memory")
+        .and_then(|ext| ext.into_memory())
+        .expect("Memory not found");
+
+    let data = memory.data(&caller);
+    let message: String = read_string(data, ptr as usize);
+
+    message
+}
+
+fn create_abort_function(store: &mut Store<WasiCtx>) -> Func {
+    Func::wrap(
+        store,
+        |mut caller: Caller<'_, WasiCtx>, message: i32, fileName: i32, line: i32, column: i32| {
+            println!("Abort function prt: {}", message);
+            Ok(())
+        },
+    )
+}
+
+fn create_log_function(store: &mut Store<WasiCtx>) -> Func {
+    Func::wrap(store, |mut caller: Caller<'_, WasiCtx>, ptr: i32| {
+        let message = get_string_from_caller(&mut caller, ptr);
+        println!("Log function prt: {}", message);
+        Ok(())
+    })
+}
+/*
+fn create_abort_function(store: &mut Store<WasiCtx>) -> Func {
+    Func::wrap(store, |caller: Caller<'_, WasiCtx>, ptr: i32| {
+        println!("console.log: {}", ptr); // Print to Rust's stdout
+    })
+}
+*/
+
 impl WasmEngine {
-    fn new(base_path: PathBuf, main: String) -> Result<Self, extism::Error> {
+    fn new(base_path: PathBuf, main: String) -> Result<Self> {
         let mut full_main_path = PathBuf::from(base_path);
         full_main_path.push(main);
 
         tracing::info!("Creating WASM engine at {:?}", full_main_path);
 
-        let wasm_file = extism::Wasm::File {
-            path: full_main_path,
-            meta: WasmMetadata::default(),
-        };
-        let manifest = Manifest::new([wasm_file]);
-        let plugin = extism::Plugin::new(&manifest, [], true)?;
+        let engine = Engine::default();
 
-        Ok(Self { plugin })
+        let mut linker = Linker::new(&engine);
+        wasi_common::sync::add_to_linker(&mut linker, |s| s)?;
+
+        let wasi = WasiCtxBuilder::new()
+            .inherit_stdio()
+            .inherit_args()?
+            .build();
+        let mut store = Store::new(&engine, wasi);
+        WasmEngine::define_functions(&mut store, &mut linker)?;
+
+        let module = Module::from_file(&engine, full_main_path)?;
+        let instance = linker.instantiate(&mut store, &module)?;
+
+        Ok(Self {
+            engine,
+            store,
+            instance,
+            linker,
+        })
+    }
+
+    fn define_functions(store: &mut Store<WasiCtx>, linker: &mut Linker<WasiCtx>) -> Result<()> {
+        let log_func = create_log_function(store);
+        let abort_func = create_abort_function(store);
+
+        {
+            let store_ref = &mut *store; // Create a mutable reference to `store`
+            linker.define(store_ref, "env", "console.log", log_func)?;
+        }
+        {
+            let store_ref = &mut *store; // Create a mutable reference to `store`
+            linker.define(store_ref, "env", "abort", abort_func)?;
+        }
+
+        Ok(())
+    }
+
+    fn create_string_pointer(&mut self, input_str: &str) -> Result<i32> {
+        let memory = self.instance.get_memory(&mut self.store, "memory").unwrap();
+        let alloc_fn = self
+            .instance
+            .get_func(&mut self.store, "__new")
+            .unwrap()
+            .typed::<(i32, i32), i32>(&self.store)?;
+
+        let len = input_str.len() as i32;
+        let ptr = alloc_fn.call(&mut self.store, (len, 1))?;
+
+        memory.write(&mut self.store, ptr as usize, input_str.as_bytes())?;
+
+        Ok(ptr)
+    }
+
+    fn get_string_pointer(&mut self, ptr: i32) -> Result<String> {
+        let memory = self.instance.get_memory(&mut self.store, "memory").unwrap();
+        let data = memory.data(&self.store);
+        let message: String = read_string(data, ptr as usize);
+
+        Ok(message)
+    }
+
+    fn call_function<Params, Results>(
+        &mut self,
+        function_name: &str,
+        params: Params,
+    ) -> Result<Results>
+    where
+        Params: WasmParams,
+        Results: WasmResults,
+    {
+        let function_instance = self
+            .instance
+            .get_func(&mut self.store, function_name)
+            .expect("`add` was not an exported function");
+        let function_instance = function_instance.typed::<Params, Results>(&mut self.store)?;
+        let result = function_instance.call(&mut self.store, params);
+        result
     }
 }
 
@@ -69,9 +190,9 @@ struct Wasm {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Conf {
-    /// The directory where Wasm extensions can be found
+    /// The directory where Rhai scripts can be found
     base_path: Option<PathBuf>,
-    /// The main entry point for Wasm extensions evaluation
+    /// The main entry point for Rhai script evaluation
     main: Option<String>,
 }
 
@@ -91,18 +212,15 @@ impl Plugin for Wasm {
         };
 
         let watched_path = base_path.clone();
-        let watched_main = main.clone();
 
         let wasm_engine = Arc::new(ArcSwap::from_pointee(Mutex::new(WasmEngine::new(
             base_path, main,
         )?)));
-        let watched_engine = wasm_engine.clone();
 
         let park_flag = Arc::new(AtomicBool::new(false));
         let watching_flag = park_flag.clone();
 
         let watcher_handle = std::thread::spawn(move || {
-            let watching_path = watched_path.clone();
             let config = Config::default()
                 .with_poll_interval(Duration::from_secs(3))
                 .with_compare_contents(true);
@@ -113,7 +231,6 @@ impl Plugin for Wasm {
                             // Let's limit the events we are interested in to:
                             //  - Modified files
                             //  - Created/Remove files
-                            //  - with suffix "wasm"
                             if matches!(
                                 event.kind,
                                 EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime))
@@ -121,34 +238,10 @@ impl Plugin for Wasm {
                                     | EventKind::Create(_)
                                     | EventKind::Remove(_)
                             ) {
-                                let mut proceed = false;
-                                for path in event.paths {
-                                    if path.extension().map_or(false, |ext| ext == "wasm") {
-                                        proceed = true;
-                                        break;
-                                    }
-                                }
-
-                                if proceed {
-                                    match WasmEngine::new(
-                                        watching_path.clone(),
-                                        watched_main.clone(),
-                                    ) {
-                                        Ok(eb) => {
-                                            tracing::info!("updating WASM execution engine");
-                                            watched_engine.store(Arc::new(Mutex::new(eb)))
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "could not create new WASM execution engine: {}",
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
+                                tracing::info!("updating WASM execution");
                             }
                         }
-                        Err(e) => tracing::error!("WASM watching event error: {:?}", e),
+                        Err(e) => tracing::error!("wasm watching event error: {:?}", e),
                     }
                 },
                 config,
@@ -157,7 +250,7 @@ impl Plugin for Wasm {
             watcher
                 .watch(&watched_path, RecursiveMode::Recursive)
                 .unwrap_or_else(|_| panic!("could not watch: {watched_path:?}"));
-            // Park the thread until this WASM instance is dropped (see Drop impl)
+            // Park the thread until this Rhai instance is dropped (see Drop impl)
             // We may actually unpark() before this code executes or exit from park() spuriously.
             // Use the watching_flag to control a loop which waits from the flag to be updated
             // from Drop.
@@ -181,26 +274,29 @@ impl Plugin for Wasm {
                     let wasm_engine_clone = wasm_engine_clone.clone(); // Clone inside the async block
                     async move {
                         tracing::info!("WASM execution: Hit router_request");
-
-                        let wasm_instance = wasm_engine_clone.load();
-                        let mut locked_instance = wasm_instance.lock().unwrap();
-                        let plugin = &mut locked_instance.plugin;
-
                         let payload = json!({
                             "version": "1",
-                            "stage": "RouterRequest",
-                            "control": "Continue"
+                            "stage": "RouterRequest"
                         });
                         let payload_string = to_string(&payload).unwrap();
-
-                        let function_result =
-                            plugin.call::<&str, &str>("RouterRequest", &payload_string)?;
-
+                        let ptr = wasm_engine_clone
+                            .load()
+                            .lock()
+                            .unwrap()
+                            .create_string_pointer(&payload_string)?;
+                        let function_result_ptr = wasm_engine_clone
+                            .load()
+                            .lock()
+                            .unwrap()
+                            .call_function::<(i32,), i32>("RouterRequest", (ptr,))?;
+                        let function_result = wasm_engine_clone
+                            .load()
+                            .lock()
+                            .unwrap()
+                            .get_string_pointer(function_result_ptr)?;
                         tracing::info!(
-                            "WASM execution: Called RouterRequest and got back: {}",
-                            function_result
+                            "WASM execution: Called RouterRequest and got {function_result}"
                         );
-
                         let result = Ok(ControlFlow::Continue(request));
                         result
                     }
