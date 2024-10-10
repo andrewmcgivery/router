@@ -2,9 +2,13 @@ use crate::error::Error;
 use crate::layers::async_checkpoint::OneShotAsyncCheckpointLayer;
 use crate::plugin::Plugin;
 use crate::plugin::PluginInit;
+use crate::plugins::coprocessor::internalize_header_map;
 use crate::register_plugin;
+use crate::services::external::externalize_header_map;
 use crate::services::external::PipelineStep;
 use crate::services::router;
+use crate::services::router::body::get_body_bytes;
+use crate::services::router::body::RouterBody;
 use arc_swap::ArcSwap;
 use extism::*;
 use http::StatusCode;
@@ -21,21 +25,24 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::to_string;
+use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::time::Duration;
 use std::{
     path::PathBuf,
     sync::{atomic::AtomicBool, Arc},
 };
+use tokio::sync::Mutex;
 use tower::util::MapFutureLayer;
 use tower::BoxError;
 use tower::ServiceBuilder;
 use tower::ServiceExt;
 
 const EXTERNALIZABLE_VERSION: u8 = 1;
+const WASM_ERROR_EXTENSION: &str = "ERROR";
+const WASM_DESERIALIZATION_ERROR_EXTENSION: &str = "WASM_DESERIALIZATION_ERROR";
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +67,8 @@ struct RouterExtensionPayload {
     stage: String,
     control: Control,
     id: String,
+    body: String,
+    headers: HashMap<String, Vec<String>>,
 }
 
 struct WasmEngine {
@@ -210,60 +219,23 @@ impl Plugin for Wasm {
                 move |request: router::Request| {
                     let wasm_engine_clone = wasm_engine_clone.clone(); // Clone inside the async block
                     async move {
-                        tracing::info!("WASM execution: Hit router_request");
-
                         let wasm_instance = wasm_engine_clone.load();
-                        let mut locked_instance = wasm_instance.lock().unwrap();
+                        let mut locked_instance = wasm_instance.lock().await;
                         let plugin = &mut locked_instance.plugin;
 
-                        let payload = json!({
-                            "version": EXTERNALIZABLE_VERSION,
-                            "stage": PipelineStep::RouterRequest,
-                            "control": Control::default(),
-                            "id": request.context.id.clone()
-                        });
-                        let payload_string = to_string(&payload).unwrap();
-
-                        let function_result =
-                            plugin.call::<&str, &str>("RouterRequest", &payload_string)?;
-
-                        tracing::info!(
-                            "WASM execution: Called RouterRequest and got back: {}",
-                            function_result
-                        );
-
-                        let returned_payload: RouterExtensionPayload =
-                            serde_json::from_str(function_result)?;
-                        let control = returned_payload.control;
-
-                        if matches!(control, Control::Break(_)) {
-                            let code = control.get_http_status()?;
-
-                            let graphql_response: crate::graphql::Response =
-                                crate::graphql::Response::builder()
-                                    .errors(vec![Error::builder()
-                                        .message("We broke!")
-                                        .extension_code("WE_BROKE")
-                                        .build()])
-                                    .build();
-
-                            let res = router::Response::builder()
-                                .errors(graphql_response.errors)
-                                .extensions(graphql_response.extensions)
-                                .status_code(code)
-                                .context(request.context);
-
-                            let mut res = match (graphql_response.label, graphql_response.data) {
-                                (Some(label), Some(data)) => res.label(label).data(data).build()?,
-                                (Some(label), None) => res.label(label).build()?,
-                                (None, Some(data)) => res.data(data).build()?,
-                                (None, None) => res.build()?,
-                            };
-
-                            return Ok(ControlFlow::Break(res));
+                        if !plugin.function_exists("RouterRequest") {
+                            return Ok(ControlFlow::Continue(request));
                         }
 
-                        let result = Ok(ControlFlow::Continue(request));
+                        let result =
+                            process_router_request_stage(request, plugin)
+                                .await
+                                .map_err(|error| {
+                                    tracing::error!(
+                                        "WASM Extension: router request stage error: {error}"
+                                    );
+                                    error
+                                });
                         result
                     }
                 },
@@ -304,6 +276,87 @@ impl Drop for Wasm {
             wh.join().expect("wasm file watcher thread terminating");
         }
     }
+}
+
+async fn process_router_request_stage(
+    mut request: router::Request,
+    plugin: &mut extism::Plugin,
+) -> Result<ControlFlow<router::Response, router::Request>, BoxError> {
+    let (parts, body) = request.router_request.into_parts();
+    let bytes = get_body_bytes(body).await?;
+    let body_to_send = String::from_utf8(bytes.to_vec())?;
+    let headers_to_send = externalize_header_map(&parts.headers)?;
+
+    let payload = json!({
+        "version": EXTERNALIZABLE_VERSION,
+        "stage": PipelineStep::RouterRequest,
+        "control": Control::default(),
+        "id": request.context.id.clone(),
+        "headers": headers_to_send,
+        "body": body_to_send
+    });
+    let payload_string = to_string(&payload).unwrap();
+
+    let function_result = plugin.call::<&str, &str>("RouterRequest", &payload_string)?;
+
+    tracing::info!(
+        "WASM execution: Called RouterRequest and got back: {}",
+        function_result
+    );
+
+    let returned_payload: RouterExtensionPayload = serde_json::from_str(function_result)?;
+    let control = returned_payload.control;
+
+    if matches!(control, Control::Break(_)) {
+        let code = control.get_http_status()?;
+
+        // At this point our body is a String. Try to get a valid JSON value from it
+        let body_as_value = serde_json::from_str(&returned_payload.body)
+            .ok()
+            .unwrap_or(serde_json::Value::Null);
+
+        // Now we have some JSON, let's see if it's the right "shape" to create a graphql_response.
+        // If it isn't, we create a graphql error response
+        let graphql_response: crate::graphql::Response = match body_as_value {
+            serde_json::Value::Null => crate::graphql::Response::builder()
+                .errors(vec![Error::builder()
+                    .message(returned_payload.body)
+                    .extension_code(WASM_ERROR_EXTENSION)
+                    .build()])
+                .build(),
+            _ => serde_json::from_value(body_as_value).unwrap_or_else(|error| {
+                crate::graphql::Response::builder()
+                    .errors(vec![Error::builder()
+                        .message(format!("couldn't deserialize WASM output body: {error}"))
+                        .extension_code(WASM_DESERIALIZATION_ERROR_EXTENSION)
+                        .build()])
+                    .build()
+            }),
+        };
+
+        let res = router::Response::builder()
+            .errors(graphql_response.errors)
+            .extensions(graphql_response.extensions)
+            .status_code(code)
+            .context(request.context);
+
+        let mut res = match (graphql_response.label, graphql_response.data) {
+            (Some(label), Some(data)) => res.label(label).data(data).build()?,
+            (Some(label), None) => res.label(label).build()?,
+            (None, Some(data)) => res.data(data).build()?,
+            (None, None) => res.build()?,
+        };
+
+        *res.response.headers_mut() = internalize_header_map(returned_payload.headers)?;
+
+        return Ok(ControlFlow::Break(res));
+    }
+
+    let new_body = RouterBody::from(returned_payload.body);
+    request.router_request = http::Request::from_parts(parts, new_body.into_inner());
+    *request.router_request.headers_mut() = internalize_header_map(returned_payload.headers)?;
+
+    return Ok(ControlFlow::Continue(request));
 }
 
 register_plugin!("apollo", "wasm", Wasm);
