@@ -71,6 +71,9 @@ struct RouterExtensionPayload {
     body: String,
     headers: HashMap<String, Vec<String>>,
     context: Context,
+    sdl: String,
+    path: String,
+    method: String,
 }
 
 struct WasmEngine {
@@ -104,6 +107,7 @@ struct Wasm {
     wasm_engine: Arc<ArcSwap<Mutex<WasmEngine>>>,
     park_flag: Arc<AtomicBool>,
     watcher_handle: Option<std::thread::JoinHandle<()>>,
+    sdl: Arc<String>,
 }
 
 /// Configuration for the Wasm Plugin
@@ -211,15 +215,18 @@ impl Plugin for Wasm {
             park_flag,
             watcher_handle: Some(watcher_handle),
             wasm_engine,
+            sdl: init.supergraph_sdl,
         })
     }
 
     fn router_service(&self, service: router::BoxService) -> router::BoxService {
         let request_layer = {
             let wasm_engine_clone = self.wasm_engine.clone();
+            let sdl = self.sdl.clone();
             Some(OneShotAsyncCheckpointLayer::new(
                 move |request: router::Request| {
-                    let wasm_engine_clone = wasm_engine_clone.clone(); // Clone inside the async block
+                    let wasm_engine_clone = wasm_engine_clone.clone();
+                    let sdl = sdl.clone();
                     async move {
                         let wasm_instance = wasm_engine_clone.load();
                         let mut locked_instance = wasm_instance.lock().await;
@@ -229,15 +236,14 @@ impl Plugin for Wasm {
                             return Ok(ControlFlow::Continue(request));
                         }
 
-                        let result =
-                            process_router_request_stage(request, plugin)
-                                .await
-                                .map_err(|error| {
-                                    tracing::error!(
-                                        "WASM Extension: router request stage error: {error}"
-                                    );
-                                    error
-                                });
+                        let result = process_router_request_stage(request, plugin, sdl)
+                            .await
+                            .map_err(|error| {
+                                tracing::error!(
+                                    "WASM Extension: router request stage error: {error}"
+                                );
+                                error
+                            });
                         result
                     }
                 },
@@ -283,12 +289,15 @@ impl Drop for Wasm {
 async fn process_router_request_stage(
     mut request: router::Request,
     plugin: &mut extism::Plugin,
+    sdl: Arc<String>,
 ) -> Result<ControlFlow<router::Response, router::Request>, BoxError> {
     let (parts, body) = request.router_request.into_parts();
     let bytes = get_body_bytes(body).await?;
     let body_to_send = String::from_utf8(bytes.to_vec())?;
     let headers_to_send = externalize_header_map(&parts.headers)?;
     let context_to_send = request.context.clone();
+    let sdl_to_send = sdl.clone().to_string();
+    let path_to_send = parts.uri.to_string();
 
     let payload = json!({
         "version": EXTERNALIZABLE_VERSION,
@@ -297,7 +306,10 @@ async fn process_router_request_stage(
         "id": request.context.id.clone(),
         "headers": headers_to_send,
         "body": body_to_send,
-        "context": context_to_send
+        "context": context_to_send,
+        "sdl": sdl_to_send,
+        "path": path_to_send,
+        "method": parts.method.to_string()
     });
     let payload_string = to_string(&payload).unwrap();
 
