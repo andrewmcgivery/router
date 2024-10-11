@@ -9,6 +9,7 @@ use crate::services::external::PipelineStep;
 use crate::services::router;
 use crate::services::router::body::get_body_bytes;
 use crate::services::router::body::RouterBody;
+use crate::Context;
 use arc_swap::ArcSwap;
 use extism::*;
 use http::StatusCode;
@@ -69,6 +70,7 @@ struct RouterExtensionPayload {
     id: String,
     body: String,
     headers: HashMap<String, Vec<String>>,
+    context: Context,
 }
 
 struct WasmEngine {
@@ -286,6 +288,7 @@ async fn process_router_request_stage(
     let bytes = get_body_bytes(body).await?;
     let body_to_send = String::from_utf8(bytes.to_vec())?;
     let headers_to_send = externalize_header_map(&parts.headers)?;
+    let context_to_send = request.context.clone();
 
     let payload = json!({
         "version": EXTERNALIZABLE_VERSION,
@@ -293,7 +296,8 @@ async fn process_router_request_stage(
         "control": Control::default(),
         "id": request.context.id.clone(),
         "headers": headers_to_send,
-        "body": body_to_send
+        "body": body_to_send,
+        "context": context_to_send
     });
     let payload_string = to_string(&payload).unwrap();
 
@@ -349,12 +353,22 @@ async fn process_router_request_stage(
 
         *res.response.headers_mut() = internalize_header_map(returned_payload.headers)?;
 
+        for (key, value) in returned_payload.context.try_into_iter()? {
+            res.context.upsert_json_value(key, move |_current| value);
+        }
+
         return Ok(ControlFlow::Break(res));
     }
 
     let new_body = RouterBody::from(returned_payload.body);
     request.router_request = http::Request::from_parts(parts, new_body.into_inner());
     *request.router_request.headers_mut() = internalize_header_map(returned_payload.headers)?;
+
+    for (key, value) in returned_payload.context.try_into_iter()? {
+        request
+            .context
+            .upsert_json_value(key, move |_current| value);
+    }
 
     return Ok(ControlFlow::Continue(request));
 }
