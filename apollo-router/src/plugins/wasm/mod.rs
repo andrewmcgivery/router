@@ -11,7 +11,12 @@ use crate::services::router::body::get_body_bytes;
 use crate::services::router::body::RouterBody;
 use crate::Context;
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use extism::*;
+use futures::future::ready;
+use futures::stream::once;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use http::StatusCode;
 use notify::event::DataChange;
 use notify::event::MetadataKind;
@@ -66,14 +71,21 @@ impl Control {
 struct RouterExtensionPayload {
     version: u8,
     stage: String,
-    control: Control,
-    id: String,
-    body: String,
-    headers: HashMap<String, Vec<String>>,
-    context: Context,
-    sdl: String,
-    path: String,
-    method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control: Option<Control>,
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<HashMap<String, Vec<String>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<Context>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sdl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
 }
 
 struct WasmEngine {
@@ -93,6 +105,8 @@ impl WasmEngine {
         };
         let manifest = Manifest::new([wasm_file]);
         let plugin = extism::Plugin::new(&manifest, [], true)?;
+
+        tracing::info!("WASM Engine created!",);
 
         Ok(Self { plugin })
     }
@@ -175,12 +189,13 @@ impl Plugin for Wasm {
                                 }
 
                                 if proceed {
+                                    tracing::info!("Update detected in WASM files. Updating WASM execution engine...");
                                     match WasmEngine::new(
                                         watching_path.clone(),
                                         watched_main.clone(),
                                     ) {
                                         Ok(eb) => {
-                                            tracing::info!("updating WASM execution engine");
+                                            tracing::info!("WASM execution engine updated.");
                                             watched_engine.store(Arc::new(Mutex::new(eb)))
                                         }
                                         Err(e) => {
@@ -228,15 +243,17 @@ impl Plugin for Wasm {
                     let wasm_engine_clone = wasm_engine_clone.clone();
                     let sdl = sdl.clone();
                     async move {
-                        let wasm_instance = wasm_engine_clone.load();
-                        let mut locked_instance = wasm_instance.lock().await;
-                        let plugin = &mut locked_instance.plugin;
+                        {
+                            let wasm_instance = wasm_engine_clone.load();
+                            let mut locked_instance = wasm_instance.lock().await;
+                            let plugin = &mut locked_instance.plugin;
 
-                        if !plugin.function_exists("RouterRequest") {
-                            return Ok(ControlFlow::Continue(request));
+                            if !plugin.function_exists("RouterRequest") {
+                                return Ok(ControlFlow::Continue(request));
+                            }
                         }
 
-                        let result = process_router_request_stage(request, plugin, sdl)
+                        let result = process_router_request_stage(request, wasm_engine_clone, sdl)
                             .await
                             .map_err(|error| {
                                 tracing::error!(
@@ -250,23 +267,50 @@ impl Plugin for Wasm {
             ))
         };
 
-        let response_layer = Some(MapFutureLayer::new(
-            move |fut: std::pin::Pin<
-                Box<
-                    dyn Future<
-                            Output = Result<
-                                router::Response,
-                                Box<dyn std::error::Error + Send + Sync>,
-                            >,
-                        > + Send,
-                >,
-            >| async {
-                let response: router::Response = fut.await?;
-                tracing::info!("WASM execution: Hit router_response");
-                let result: Result<router::Response, BoxError> = Ok(response);
-                result
-            },
-        ));
+        let response_layer = {
+            let wasm_engine_clone = self.wasm_engine.clone();
+            let sdl = self.sdl.clone();
+            Some(MapFutureLayer::new(
+                move |fut: std::pin::Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    router::Response,
+                                    Box<dyn std::error::Error + Send + Sync>,
+                                >,
+                            > + Send,
+                    >,
+                >| {
+                    let wasm_engine_clone = wasm_engine_clone.clone();
+                    let sdl = sdl.clone();
+                    async move {
+                        let response: router::Response = fut.await?;
+
+                        {
+                            let wasm_instance = wasm_engine_clone.load();
+                            let mut locked_instance = wasm_instance.lock().await;
+                            let plugin = &mut locked_instance.plugin;
+
+                            if !plugin.function_exists("RouterResponse") {
+                                return Ok(response);
+                            }
+                        }
+
+                        let result =
+                            process_router_response_stage(response, wasm_engine_clone, sdl)
+                                .await
+                                .map_err(|error| {
+                                    tracing::error!(
+                                "external extensibility: router response stage error: {error}"
+                            );
+                                    error
+                                });
+
+                        result
+                    }
+                },
+            ))
+        };
 
         ServiceBuilder::new()
             .option_layer(request_layer)
@@ -288,7 +332,7 @@ impl Drop for Wasm {
 
 async fn process_router_request_stage(
     mut request: router::Request,
-    plugin: &mut extism::Plugin,
+    wasm_engine: Arc<ArcSwap<Mutex<WasmEngine>>>,
     sdl: Arc<String>,
 ) -> Result<ControlFlow<router::Response, router::Request>, BoxError> {
     let (parts, body) = request.router_request.into_parts();
@@ -313,22 +357,24 @@ async fn process_router_request_stage(
     });
     let payload_string = to_string(&payload).unwrap();
 
+    let wasm_instance = wasm_engine.load();
+    let mut locked_instance = wasm_instance.lock().await;
+    let plugin = &mut locked_instance.plugin;
     let function_result = plugin.call::<&str, &str>("RouterRequest", &payload_string)?;
 
-    tracing::info!(
-        "WASM execution: Called RouterRequest and got back: {}",
-        function_result
-    );
-
     let returned_payload: RouterExtensionPayload = serde_json::from_str(function_result)?;
-    let control = returned_payload.control;
+    let control = returned_payload
+        .control
+        .expect("We should have validation similar to coprocessor");
 
     if matches!(control, Control::Break(_)) {
         let code = control.get_http_status()?;
 
         // At this point our body is a String. Try to get a valid JSON value from it
-        let body_as_value = serde_json::from_str(&returned_payload.body)
-            .ok()
+        let body_as_value = returned_payload
+            .body
+            .as_ref()
+            .and_then(|b| serde_json::from_str(b).ok())
             .unwrap_or(serde_json::Value::Null);
 
         // Now we have some JSON, let's see if it's the right "shape" to create a graphql_response.
@@ -336,7 +382,11 @@ async fn process_router_request_stage(
         let graphql_response: crate::graphql::Response = match body_as_value {
             serde_json::Value::Null => crate::graphql::Response::builder()
                 .errors(vec![Error::builder()
-                    .message(returned_payload.body)
+                    .message(
+                        returned_payload
+                            .body
+                            .expect("We should have validation similar to coprocessor"),
+                    )
                     .extension_code(WASM_ERROR_EXTENSION)
                     .build()])
                 .build(),
@@ -363,26 +413,189 @@ async fn process_router_request_stage(
             (None, None) => res.build()?,
         };
 
-        *res.response.headers_mut() = internalize_header_map(returned_payload.headers)?;
+        if let Some(headers) = returned_payload.headers {
+            *res.response.headers_mut() = internalize_header_map(headers)?;
+        }
 
-        for (key, value) in returned_payload.context.try_into_iter()? {
-            res.context.upsert_json_value(key, move |_current| value);
+        if let Some(context) = returned_payload.context {
+            for (key, value) in context.try_into_iter()? {
+                res.context.upsert_json_value(key, move |_current| value);
+            }
         }
 
         return Ok(ControlFlow::Break(res));
     }
 
-    let new_body = RouterBody::from(returned_payload.body);
-    request.router_request = http::Request::from_parts(parts, new_body.into_inner());
-    *request.router_request.headers_mut() = internalize_header_map(returned_payload.headers)?;
+    let new_body = match returned_payload.body {
+        Some(bytes) => RouterBody::from(bytes),
+        None => RouterBody::from(bytes),
+    };
 
-    for (key, value) in returned_payload.context.try_into_iter()? {
-        request
-            .context
-            .upsert_json_value(key, move |_current| value);
+    request.router_request = http::Request::from_parts(parts, new_body.into_inner());
+
+    if let Some(context) = returned_payload.context {
+        for (key, value) in context.try_into_iter()? {
+            request
+                .context
+                .upsert_json_value(key, move |_current| value);
+        }
+    }
+
+    if let Some(headers) = returned_payload.headers {
+        *request.router_request.headers_mut() = internalize_header_map(headers)?;
     }
 
     return Ok(ControlFlow::Continue(request));
+}
+
+async fn process_router_response_stage(
+    mut response: router::Response,
+    wasm_engine: Arc<ArcSwap<Mutex<WasmEngine>>>,
+    sdl: Arc<String>,
+) -> Result<router::Response, BoxError> {
+    let (parts, body) = response.response.into_parts();
+    let (first, rest): (
+        Option<Result<Bytes, hyper::Error>>,
+        crate::services::router::Body,
+    ) = body.into_future().await;
+
+    let opt_first: Option<Bytes> = first.and_then(|f| f.ok());
+    let bytes = match opt_first {
+        Some(b) => b,
+        None => {
+            tracing::error!("Wasm cannot convert body into future due to problem with first part");
+            return Err(BoxError::from(
+                "Wasm cannot convert body into future due to problem with first part",
+            ));
+        }
+    };
+    let body_to_send = String::from_utf8(bytes.to_vec())?;
+    let headers_to_send = externalize_header_map(&parts.headers)?;
+    let context_to_send = response.context.clone();
+    let sdl_to_send = sdl.clone().to_string();
+    let status_to_send = parts.status.as_u16();
+
+    let payload = json!({
+        "version": EXTERNALIZABLE_VERSION,
+        "stage": PipelineStep::RouterResponse,
+        "control": Control::default(),
+        "id": response.context.id.clone(),
+        "headers": headers_to_send,
+        "body": body_to_send,
+        "context": context_to_send,
+        "sdl": sdl_to_send,
+        "status": status_to_send,
+    });
+    let payload_string = to_string(&payload).unwrap();
+
+    let wasm_instance = wasm_engine.load();
+    let mut locked_instance = wasm_instance.lock().await;
+    let plugin = &mut locked_instance.plugin;
+
+    let function_result = plugin.call::<&str, &str>("RouterResponse", &payload_string)?;
+    let returned_payload: RouterExtensionPayload = serde_json::from_str(function_result)?;
+
+    let new_body = match returned_payload.body {
+        Some(bytes) => RouterBody::from(bytes),
+        None => RouterBody::from(bytes),
+    };
+
+    response.response = http::Response::from_parts(parts, new_body.into_inner());
+
+    if let Some(control) = returned_payload.control {
+        *response.response.status_mut() = control.get_http_status()?
+    }
+
+    if let Some(context) = returned_payload.context {
+        for (key, value) in context.try_into_iter()? {
+            response
+                .context
+                .upsert_json_value(key, move |_current| value);
+        }
+    }
+
+    if let Some(headers) = returned_payload.headers {
+        *response.response.headers_mut() = internalize_header_map(headers)?;
+    }
+
+    // Now break our WASM modified response back into parts
+    let (parts, body) = response.response.into_parts();
+
+    // Clone all the bits we need
+    let context = response.context.clone();
+    let map_context = response.context.clone();
+
+    // Map the rest of our body to process subsequent chunks of response
+    let mapped_stream = rest
+        .map_err(BoxError::from)
+        .and_then(move |deferred_response| {
+            //let generator_client = http_client.clone();
+            let generator_wasm_engine = wasm_engine.clone();
+            let generator_map_context = map_context.clone();
+            let generator_sdl_to_send = sdl_to_send.clone();
+            let generator_id = map_context.id.clone();
+
+            async move {
+                let bytes = deferred_response.to_vec();
+                let body_to_send = String::from_utf8(bytes.to_vec())?;
+                let context_to_send = generator_map_context.clone();
+
+                // Note: We deliberately DO NOT send headers or status_code even if the user has
+                // requested them. That's because they are meaningless on a deferred response and
+                // providing them will be a source of confusion.
+                let payload = json!({
+                    "version": EXTERNALIZABLE_VERSION,
+                    "stage": PipelineStep::RouterResponse,
+                    "control": Control::default(),
+                    "id": generator_id,
+                    "body": body_to_send,
+                    "context": context_to_send,
+                    "sdl": generator_sdl_to_send,
+                });
+                let payload_string = to_string(&payload).unwrap();
+
+                let wasm_instance = generator_wasm_engine.load();
+                let mut locked_instance = wasm_instance.lock().await;
+                let plugin = &mut locked_instance.plugin;
+                let function_result =
+                    plugin.call::<&str, &str>("RouterResponse", &payload_string)?;
+
+                let returned_payload: RouterExtensionPayload =
+                    serde_json::from_str(function_result)?;
+
+                // Third, process our reply and act on the contents. Our processing logic is
+                // that we replace "bits" of our incoming response with the updated bits if they
+                // are present in our returned_payload. If they aren't present, just use the
+                // bits that we sent to the WASM plugin.
+                let final_bytes: Bytes = match returned_payload.body {
+                    Some(bytes) => bytes.into(),
+                    None => bytes.into(),
+                };
+
+                if let Some(context) = returned_payload.context {
+                    for (key, value) in context.try_into_iter()? {
+                        generator_map_context.upsert_json_value(key, move |_current| value);
+                    }
+                }
+
+                // We return the final_bytes into our stream of response chunks
+                Ok(final_bytes)
+            }
+        });
+
+    // Create our response stream which consists of the bytes from our first body chained with the
+    // rest of the responses in our mapped stream.
+    let bytes = get_body_bytes(body).await.map_err(BoxError::from);
+    let final_stream = once(ready(bytes)).chain(mapped_stream).boxed();
+
+    // Finally, return a response which has a Body that wraps our stream of response chunks.
+    Ok(router::Response {
+        context,
+        response: http::Response::from_parts(
+            parts,
+            RouterBody::wrap_stream(final_stream).into_inner(),
+        ),
+    })
 }
 
 register_plugin!("apollo", "wasm", Wasm);
