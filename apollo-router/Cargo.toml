@@ -273,6 +273,7 @@ ahash = "0.8.11"
 itoa = "1.0.9"
 ryu = "1.0.15"
 form_urlencoded = "1.2.1"
+extism = "1.7.0"
 
 [target.'cfg(macos)'.dependencies]
 uname = "0.1.1"

@@ -706,6 +706,7 @@ pub(crate) async fn create_plugins(
     // This relative ordering is documented in `docs/source/customizations/native.mdx`:
     add_optional_apollo_plugin!("rhai");
     add_optional_apollo_plugin!("coprocessor");
+    add_optional_apollo_plugin!("wasm");
     add_optional_apollo_plugin!("preview_connectors");
     add_user_plugins!();
 
