@@ -282,46 +282,34 @@ impl Plugin for Wasm {
         let response_layer = {
             let wasm_engine_clone = self.wasm_engine.clone();
             let sdl = self.sdl.clone();
-            Some(MapFutureLayer::new(
-                move |fut: std::pin::Pin<
-                    Box<
-                        dyn Future<
-                                Output = Result<
-                                    router::Response,
-                                    Box<dyn std::error::Error + Send + Sync>,
-                                >,
-                            > + Send,
-                    >,
-                >| {
-                    let wasm_engine_clone = wasm_engine_clone.clone();
-                    let sdl = sdl.clone();
-                    async move {
-                        let response: router::Response = fut.await?;
+            Some(MapFutureLayer::new(move |fut| {
+                let wasm_engine_clone = wasm_engine_clone.clone();
+                let sdl = sdl.clone();
+                async move {
+                    let response: router::Response = fut.await?;
 
-                        {
-                            let wasm_instance = wasm_engine_clone.load();
-                            let mut locked_instance = wasm_instance.lock().await;
-                            let plugin = &mut locked_instance.plugin;
+                    {
+                        let wasm_instance = wasm_engine_clone.load();
+                        let mut locked_instance = wasm_instance.lock().await;
+                        let plugin = &mut locked_instance.plugin;
 
-                            if !plugin.function_exists("RouterResponse") {
-                                return Ok(response);
-                            }
+                        if !plugin.function_exists("RouterResponse") {
+                            return Ok(response);
                         }
+                    }
 
-                        let result =
-                            process_router_response_stage(response, wasm_engine_clone, sdl)
-                                .await
-                                .map_err(|error| {
-                                    tracing::error!(
+                    let result = process_router_response_stage(response, wasm_engine_clone, sdl)
+                        .await
+                        .map_err(|error| {
+                            tracing::error!(
                                 "external extensibility: router response stage error: {error}"
                             );
-                                    error
-                                });
+                            error
+                        });
 
-                        result
-                    }
-                },
-            ))
+                    result
+                }
+            }))
         };
 
         ServiceBuilder::new()
@@ -371,46 +359,35 @@ impl Plugin for Wasm {
         let response_layer = {
             let wasm_engine_clone = self.wasm_engine.clone();
             let sdl = self.sdl.clone();
-            Some(MapFutureLayer::new(
-                move |fut: std::pin::Pin<
-                    Box<
-                        dyn Future<
-                                Output = Result<
-                                    supergraph::Response,
-                                    Box<dyn std::error::Error + Send + Sync>,
-                                >,
-                            > + Send,
-                    >,
-                >| {
-                    let wasm_engine_clone = wasm_engine_clone.clone();
-                    let sdl = sdl.clone();
-                    async move {
-                        let response: supergraph::Response = fut.await?;
+            Some(MapFutureLayer::new(move |fut| {
+                let wasm_engine_clone = wasm_engine_clone.clone();
+                let sdl = sdl.clone();
+                async move {
+                    let response: supergraph::Response = fut.await?;
 
-                        {
-                            let wasm_instance = wasm_engine_clone.load();
-                            let mut locked_instance = wasm_instance.lock().await;
-                            let plugin = &mut locked_instance.plugin;
+                    {
+                        let wasm_instance = wasm_engine_clone.load();
+                        let mut locked_instance = wasm_instance.lock().await;
+                        let plugin = &mut locked_instance.plugin;
 
-                            if !plugin.function_exists("SupergraphResponse") {
-                                return Ok(response);
-                            }
+                        if !plugin.function_exists("SupergraphResponse") {
+                            return Ok(response);
                         }
+                    }
 
-                        let result =
-                            process_supergraph_response_stage(response, wasm_engine_clone, sdl)
-                                .await
-                                .map_err(|error| {
-                                    tracing::error!(
+                    let result =
+                        process_supergraph_response_stage(response, wasm_engine_clone, sdl)
+                            .await
+                            .map_err(|error| {
+                                tracing::error!(
                                 "external extensibility: Supergraph response stage error: {error}"
                             );
-                                    error
-                                });
+                                error
+                            });
 
-                        result
-                    }
-                },
-            ))
+                    result
+                }
+            }))
         };
 
         ServiceBuilder::new()
