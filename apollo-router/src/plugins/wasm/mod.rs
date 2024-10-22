@@ -1,6 +1,10 @@
 mod router_service;
 mod supergraph_service;
 
+use crate::cache::redis::RedisCacheStorage;
+use crate::cache::redis::RedisKey;
+use crate::cache::redis::RedisValue;
+use crate::configuration::RedisCache;
 use crate::layers::async_checkpoint::OneShotAsyncCheckpointLayer;
 use crate::plugin::Plugin;
 use crate::plugin::PluginInit;
@@ -40,6 +44,42 @@ use tower::util::MapFutureLayer;
 use tower::BoxError;
 use tower::ServiceBuilder;
 use tower::ServiceExt;
+
+// Define __redis_get function
+host_fn!(__redis_get(user_data: Option<RedisCacheStorage>; key: String) -> String {
+    let redis_mutex = user_data.get()?;
+    let redis_guard = redis_mutex.lock().unwrap();
+    let redis_store = redis_guard.as_ref().expect("Expected Redis store to be available");
+
+    // This monstrosity is because this function must be sync and async is not well supported in WASM land
+    // As a result, we have to "fake" a sync function here since our RedisCacheStorage is only async right now
+    // If this were "for real", we would likely refactor RedisCacheStorage to allow for a blocking sync API
+    let result: Option<RedisValue<String>> = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            redis_store.get(RedisKey(key)).await
+        })
+    });
+    let value = result.unwrap_or_else(|| RedisValue(String::from(""))).0;
+
+    Ok(value)
+});
+
+// Define __redis_set function
+host_fn!(__redis_set(user_data: Option<RedisCacheStorage>; key: String, value: String, ttl: String) {
+    let redis_mutex = user_data.get()?;
+    let redis_guard = redis_mutex.lock().unwrap();
+    let redis_store = redis_guard.as_ref().expect("Expected Redis store to be available");
+    let ttl: i32 = ttl.parse().expect("Failed to parse ttl into integer");
+
+    // See above
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            redis_store.insert(RedisKey(key), RedisValue(value), Some(Duration::from_secs(ttl as u64))).await
+        })
+    });
+
+    Ok(())
+});
 
 pub(crate) const WASM_VERSION: u8 = 1;
 const WASM_ERROR_EXTENSION: &str = "ERROR";
@@ -92,7 +132,11 @@ pub(crate) struct WasmEngine {
 }
 
 impl WasmEngine {
-    fn new(base_path: PathBuf, main: String) -> Result<Self, extism::Error> {
+    fn new(
+        base_path: PathBuf,
+        main: String,
+        redis_store: UserData<Option<RedisCacheStorage>>,
+    ) -> Result<Self, extism::Error> {
         let mut full_main_path = PathBuf::from(base_path);
         full_main_path.push(main);
 
@@ -103,7 +147,23 @@ impl WasmEngine {
             meta: WasmMetadata::default(),
         };
         let manifest = Manifest::new([wasm_file]);
-        let plugin = extism::Plugin::new(&manifest, [], true)?;
+        let plugin = extism::PluginBuilder::new(&manifest)
+            .with_wasi(true)
+            .with_function(
+                "__redis_get",
+                [PTR],
+                [PTR],
+                redis_store.clone(),
+                __redis_get,
+            )
+            .with_function(
+                "__redis_set",
+                [PTR, PTR, PTR],
+                [],
+                redis_store.clone(),
+                __redis_set,
+            )
+            .build()?;
 
         tracing::info!("WASM Engine created!",);
 
@@ -131,6 +191,8 @@ pub(crate) struct Conf {
     base_path: Option<PathBuf>,
     /// The main entry point for Wasm extensions evaluation
     main: Option<String>,
+    /// Configuration if wanting to use Redis from WASM
+    redis: Option<RedisCache>,
 }
 
 #[async_trait::async_trait]
@@ -138,6 +200,22 @@ impl Plugin for Wasm {
     type Config = Conf;
 
     async fn new(init: PluginInit<Self::Config>) -> Result<Self, BoxError> {
+        let redis_config = init.config.redis;
+        let redis_cache = if redis_config.is_some() {
+            UserData::new(Some(
+                match RedisCacheStorage::new(redis_config.unwrap()).await {
+                    Ok(storage) => Some(storage),
+                    Err(e) => {
+                        tracing::error!("could not open connection to Redis for caching");
+                        return Err(e);
+                    }
+                }
+                .unwrap(),
+            ))
+        } else {
+            UserData::new(None)
+        };
+
         let base_path = match init.config.base_path {
             Some(path) => path,
             None => "wasm".into(),
@@ -150,9 +228,12 @@ impl Plugin for Wasm {
 
         let watched_path = base_path.clone();
         let watched_main = main.clone();
+        let watched_redis_store = redis_cache.clone();
 
         let wasm_engine = Arc::new(ArcSwap::from_pointee(Mutex::new(WasmEngine::new(
-            base_path, main,
+            base_path,
+            main,
+            redis_cache,
         )?)));
         let watched_engine = wasm_engine.clone();
 
@@ -192,6 +273,7 @@ impl Plugin for Wasm {
                                     match WasmEngine::new(
                                         watching_path.clone(),
                                         watched_main.clone(),
+                                        watched_redis_store.clone()
                                     ) {
                                         Ok(eb) => {
                                             tracing::info!("WASM execution engine updated.");
