@@ -1,27 +1,20 @@
-use crate::error::Error;
-use crate::graphql;
+mod router_service;
+mod supergraph_service;
+
+use crate::cache::redis::RedisCacheStorage;
+use crate::cache::redis::RedisKey;
+use crate::cache::redis::RedisValue;
+use crate::configuration::RedisCache;
 use crate::layers::async_checkpoint::OneShotAsyncCheckpointLayer;
 use crate::plugin::Plugin;
 use crate::plugin::PluginInit;
-use crate::plugins::coprocessor::internalize_header_map;
 use crate::register_plugin;
 use crate::services;
-use crate::services::external::externalize_header_map;
-use crate::services::external::PipelineStep;
 use crate::services::router;
-use crate::services::router::body::get_body_bytes;
-use crate::services::router::body::RouterBody;
 use crate::services::supergraph;
 use crate::Context;
 use arc_swap::ArcSwap;
-use bytes::Bytes;
 use extism::*;
-use futures::future;
-use futures::future::ready;
-use futures::stream;
-use futures::stream::once;
-use futures::StreamExt;
-use futures::TryStreamExt;
 use http::StatusCode;
 use notify::event::DataChange;
 use notify::event::MetadataKind;
@@ -31,14 +24,12 @@ use notify::EventKind;
 use notify::PollWatcher;
 use notify::RecursiveMode;
 use notify::Watcher;
+use router_service::process_router_request_stage;
+use router_service::process_router_response_stage;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::json;
-use serde_json::to_string;
-use serde_json::Value;
 use std::collections::HashMap;
-use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -46,15 +37,51 @@ use std::{
     path::PathBuf,
     sync::{atomic::AtomicBool, Arc},
 };
+use supergraph_service::process_supergraph_request_stage;
+use supergraph_service::process_supergraph_response_stage;
 use tokio::sync::Mutex;
 use tower::util::MapFutureLayer;
 use tower::BoxError;
 use tower::ServiceBuilder;
 use tower::ServiceExt;
 
-use super::coprocessor::handle_graphql_response;
+// Define __redis_get function
+host_fn!(__redis_get(user_data: Option<RedisCacheStorage>; key: String) -> String {
+    let redis_mutex = user_data.get()?;
+    let redis_guard = redis_mutex.lock().unwrap();
+    let redis_store = redis_guard.as_ref().expect("Expected Redis store to be available");
 
-const EXTERNALIZABLE_VERSION: u8 = 1;
+    // This monstrosity is because this function must be sync and async is not well supported in WASM land
+    // As a result, we have to "fake" a sync function here since our RedisCacheStorage is only async right now
+    // If this were "for real", we would likely refactor RedisCacheStorage to allow for a blocking sync API
+    let result: Option<RedisValue<String>> = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            redis_store.get(RedisKey(key)).await
+        })
+    });
+    let value = result.unwrap_or_else(|| RedisValue(String::from(""))).0;
+
+    Ok(value)
+});
+
+// Define __redis_set function
+host_fn!(__redis_set(user_data: Option<RedisCacheStorage>; key: String, value: String, ttl: String) {
+    let redis_mutex = user_data.get()?;
+    let redis_guard = redis_mutex.lock().unwrap();
+    let redis_store = redis_guard.as_ref().expect("Expected Redis store to be available");
+    let ttl: i32 = ttl.parse().expect("Failed to parse ttl into integer");
+
+    // See above
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            redis_store.insert(RedisKey(key), RedisValue(value), Some(Duration::from_secs(ttl as u64))).await
+        })
+    });
+
+    Ok(())
+});
+
+pub(crate) const WASM_VERSION: u8 = 1;
 const WASM_ERROR_EXTENSION: &str = "ERROR";
 const WASM_DESERIALIZATION_ERROR_EXTENSION: &str = "WASM_DESERIALIZATION_ERROR";
 
@@ -76,7 +103,7 @@ impl Control {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct RouterExtensionPayload<T> {
+pub(crate) struct RouterExtensionPayload<T> {
     version: u8,
     stage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,12 +127,16 @@ struct RouterExtensionPayload<T> {
     has_next: Option<bool>,
 }
 
-struct WasmEngine {
+pub(crate) struct WasmEngine {
     plugin: extism::Plugin,
 }
 
 impl WasmEngine {
-    fn new(base_path: PathBuf, main: String) -> Result<Self, extism::Error> {
+    fn new(
+        base_path: PathBuf,
+        main: String,
+        redis_store: UserData<Option<RedisCacheStorage>>,
+    ) -> Result<Self, extism::Error> {
         let mut full_main_path = PathBuf::from(base_path);
         full_main_path.push(main);
 
@@ -116,7 +147,23 @@ impl WasmEngine {
             meta: WasmMetadata::default(),
         };
         let manifest = Manifest::new([wasm_file]);
-        let plugin = extism::Plugin::new(&manifest, [], true)?;
+        let plugin = extism::PluginBuilder::new(&manifest)
+            .with_wasi(true)
+            .with_function(
+                "__redis_get",
+                [PTR],
+                [PTR],
+                redis_store.clone(),
+                __redis_get,
+            )
+            .with_function(
+                "__redis_set",
+                [PTR, PTR, PTR],
+                [],
+                redis_store.clone(),
+                __redis_set,
+            )
+            .build()?;
 
         tracing::info!("WASM Engine created!",);
 
@@ -144,6 +191,8 @@ pub(crate) struct Conf {
     base_path: Option<PathBuf>,
     /// The main entry point for Wasm extensions evaluation
     main: Option<String>,
+    /// Configuration if wanting to use Redis from WASM
+    redis: Option<RedisCache>,
 }
 
 #[async_trait::async_trait]
@@ -151,6 +200,22 @@ impl Plugin for Wasm {
     type Config = Conf;
 
     async fn new(init: PluginInit<Self::Config>) -> Result<Self, BoxError> {
+        let redis_config = init.config.redis;
+        let redis_cache = if redis_config.is_some() {
+            UserData::new(Some(
+                match RedisCacheStorage::new(redis_config.unwrap()).await {
+                    Ok(storage) => Some(storage),
+                    Err(e) => {
+                        tracing::error!("could not open connection to Redis for caching");
+                        return Err(e);
+                    }
+                }
+                .unwrap(),
+            ))
+        } else {
+            UserData::new(None)
+        };
+
         let base_path = match init.config.base_path {
             Some(path) => path,
             None => "wasm".into(),
@@ -163,9 +228,12 @@ impl Plugin for Wasm {
 
         let watched_path = base_path.clone();
         let watched_main = main.clone();
+        let watched_redis_store = redis_cache.clone();
 
         let wasm_engine = Arc::new(ArcSwap::from_pointee(Mutex::new(WasmEngine::new(
-            base_path, main,
+            base_path,
+            main,
+            redis_cache,
         )?)));
         let watched_engine = wasm_engine.clone();
 
@@ -205,6 +273,7 @@ impl Plugin for Wasm {
                                     match WasmEngine::new(
                                         watching_path.clone(),
                                         watched_main.clone(),
+                                        watched_redis_store.clone()
                                     ) {
                                         Ok(eb) => {
                                             tracing::info!("WASM execution engine updated.");
@@ -406,520 +475,6 @@ impl Drop for Wasm {
             wh.join().expect("wasm file watcher thread terminating");
         }
     }
-}
-
-async fn process_router_request_stage(
-    mut request: router::Request,
-    wasm_engine: Arc<ArcSwap<Mutex<WasmEngine>>>,
-    sdl: Arc<String>,
-) -> Result<ControlFlow<router::Response, router::Request>, BoxError> {
-    let (parts, body) = request.router_request.into_parts();
-    let bytes = get_body_bytes(body).await?;
-    let body_to_send = String::from_utf8(bytes.to_vec())?;
-    let headers_to_send = externalize_header_map(&parts.headers)?;
-    let context_to_send = request.context.clone();
-    let sdl_to_send = sdl.clone().to_string();
-    let path_to_send = parts.uri.to_string();
-
-    let payload = json!({
-        "version": EXTERNALIZABLE_VERSION,
-        "stage": PipelineStep::RouterRequest,
-        "control": Control::default(),
-        "id": request.context.id.clone(),
-        "headers": headers_to_send,
-        "body": body_to_send,
-        "context": context_to_send,
-        "sdl": sdl_to_send,
-        "path": path_to_send,
-        "method": parts.method.to_string()
-    });
-    let payload_string = to_string(&payload).unwrap();
-
-    let wasm_instance = wasm_engine.load();
-    let mut locked_instance = wasm_instance.lock().await;
-    let plugin = &mut locked_instance.plugin;
-    let function_result = plugin.call::<&str, &str>("RouterRequest", &payload_string)?;
-
-    let returned_payload: RouterExtensionPayload<String> = serde_json::from_str(function_result)?;
-    let control = returned_payload
-        .control
-        .expect("We should have validation similar to coprocessor");
-
-    if matches!(control, Control::Break(_)) {
-        let code = control.get_http_status()?;
-
-        // At this point our body is a String. Try to get a valid JSON value from it
-        let body_as_value = returned_payload
-            .body
-            .as_ref()
-            .and_then(|b| serde_json::from_str(b).ok())
-            .unwrap_or(serde_json::Value::Null);
-
-        // Now we have some JSON, let's see if it's the right "shape" to create a graphql_response.
-        // If it isn't, we create a graphql error response
-        let graphql_response: crate::graphql::Response = match body_as_value {
-            serde_json::Value::Null => crate::graphql::Response::builder()
-                .errors(vec![Error::builder()
-                    .message(
-                        returned_payload
-                            .body
-                            .expect("We should have validation similar to coprocessor"),
-                    )
-                    .extension_code(WASM_ERROR_EXTENSION)
-                    .build()])
-                .build(),
-            _ => serde_json::from_value(body_as_value).unwrap_or_else(|error| {
-                crate::graphql::Response::builder()
-                    .errors(vec![Error::builder()
-                        .message(format!("couldn't deserialize WASM output body: {error}"))
-                        .extension_code(WASM_DESERIALIZATION_ERROR_EXTENSION)
-                        .build()])
-                    .build()
-            }),
-        };
-
-        let res = router::Response::builder()
-            .errors(graphql_response.errors)
-            .extensions(graphql_response.extensions)
-            .status_code(code)
-            .context(request.context);
-
-        let mut res = match (graphql_response.label, graphql_response.data) {
-            (Some(label), Some(data)) => res.label(label).data(data).build()?,
-            (Some(label), None) => res.label(label).build()?,
-            (None, Some(data)) => res.data(data).build()?,
-            (None, None) => res.build()?,
-        };
-
-        if let Some(headers) = returned_payload.headers {
-            *res.response.headers_mut() = internalize_header_map(headers)?;
-        }
-
-        if let Some(context) = returned_payload.context {
-            for (key, value) in context.try_into_iter()? {
-                res.context.upsert_json_value(key, move |_current| value);
-            }
-        }
-
-        return Ok(ControlFlow::Break(res));
-    }
-
-    let new_body = match returned_payload.body {
-        Some(bytes) => RouterBody::from(bytes),
-        None => RouterBody::from(bytes),
-    };
-
-    request.router_request = http::Request::from_parts(parts, new_body.into_inner());
-
-    if let Some(context) = returned_payload.context {
-        for (key, value) in context.try_into_iter()? {
-            request
-                .context
-                .upsert_json_value(key, move |_current| value);
-        }
-    }
-
-    if let Some(headers) = returned_payload.headers {
-        *request.router_request.headers_mut() = internalize_header_map(headers)?;
-    }
-
-    return Ok(ControlFlow::Continue(request));
-}
-
-async fn process_router_response_stage(
-    mut response: router::Response,
-    wasm_engine: Arc<ArcSwap<Mutex<WasmEngine>>>,
-    sdl: Arc<String>,
-) -> Result<router::Response, BoxError> {
-    let (parts, body) = response.response.into_parts();
-    let (first, rest): (
-        Option<Result<Bytes, hyper::Error>>,
-        crate::services::router::Body,
-    ) = body.into_future().await;
-
-    let opt_first: Option<Bytes> = first.and_then(|f| f.ok());
-    let bytes = match opt_first {
-        Some(b) => b,
-        None => {
-            tracing::error!("Wasm cannot convert body into future due to problem with first part");
-            return Err(BoxError::from(
-                "Wasm cannot convert body into future due to problem with first part",
-            ));
-        }
-    };
-    let body_to_send = String::from_utf8(bytes.to_vec())?;
-    let headers_to_send = externalize_header_map(&parts.headers)?;
-    let context_to_send = response.context.clone();
-    let sdl_to_send = sdl.clone().to_string();
-    let status_to_send = parts.status.as_u16();
-
-    let payload = json!({
-        "version": EXTERNALIZABLE_VERSION,
-        "stage": PipelineStep::RouterResponse,
-        "control": Control::default(),
-        "id": response.context.id.clone(),
-        "headers": headers_to_send,
-        "body": body_to_send,
-        "context": context_to_send,
-        "sdl": sdl_to_send,
-        "status": status_to_send,
-    });
-    let payload_string = to_string(&payload).unwrap();
-
-    let wasm_instance = wasm_engine.load();
-    let mut locked_instance = wasm_instance.lock().await;
-    let plugin = &mut locked_instance.plugin;
-
-    let function_result = plugin.call::<&str, &str>("RouterResponse", &payload_string)?;
-    let returned_payload: RouterExtensionPayload<String> = serde_json::from_str(function_result)?;
-
-    let new_body = match returned_payload.body {
-        Some(bytes) => RouterBody::from(bytes),
-        None => RouterBody::from(bytes),
-    };
-
-    response.response = http::Response::from_parts(parts, new_body.into_inner());
-
-    if let Some(control) = returned_payload.control {
-        *response.response.status_mut() = control.get_http_status()?
-    }
-
-    if let Some(context) = returned_payload.context {
-        for (key, value) in context.try_into_iter()? {
-            response
-                .context
-                .upsert_json_value(key, move |_current| value);
-        }
-    }
-
-    if let Some(headers) = returned_payload.headers {
-        *response.response.headers_mut() = internalize_header_map(headers)?;
-    }
-
-    // Now break our WASM modified response back into parts
-    let (parts, body) = response.response.into_parts();
-
-    // Clone all the bits we need
-    let context = response.context.clone();
-    let map_context = response.context.clone();
-
-    // Map the rest of our body to process subsequent chunks of response
-    let mapped_stream = rest
-        .map_err(BoxError::from)
-        .and_then(move |deferred_response| {
-            //let generator_client = http_client.clone();
-            let generator_wasm_engine = wasm_engine.clone();
-            let generator_map_context = map_context.clone();
-            let generator_sdl_to_send = sdl_to_send.clone();
-            let generator_id = map_context.id.clone();
-
-            async move {
-                let bytes = deferred_response.to_vec();
-                let body_to_send = String::from_utf8(bytes.to_vec())?;
-                let context_to_send = generator_map_context.clone();
-
-                // Note: We deliberately DO NOT send headers or status_code even if the user has
-                // requested them. That's because they are meaningless on a deferred response and
-                // providing them will be a source of confusion.
-                let payload = json!({
-                    "version": EXTERNALIZABLE_VERSION,
-                    "stage": PipelineStep::RouterResponse,
-                    "control": Control::default(),
-                    "id": generator_id,
-                    "body": body_to_send,
-                    "context": context_to_send,
-                    "sdl": generator_sdl_to_send,
-                });
-                let payload_string = to_string(&payload).unwrap();
-
-                let wasm_instance = generator_wasm_engine.load();
-                let mut locked_instance = wasm_instance.lock().await;
-                let plugin = &mut locked_instance.plugin;
-                let function_result =
-                    plugin.call::<&str, &str>("RouterResponse", &payload_string)?;
-
-                let returned_payload: RouterExtensionPayload<String> =
-                    serde_json::from_str(function_result)?;
-
-                // Third, process our reply and act on the contents. Our processing logic is
-                // that we replace "bits" of our incoming response with the updated bits if they
-                // are present in our returned_payload. If they aren't present, just use the
-                // bits that we sent to the WASM plugin.
-                let final_bytes: Bytes = match returned_payload.body {
-                    Some(bytes) => bytes.into(),
-                    None => bytes.into(),
-                };
-
-                if let Some(context) = returned_payload.context {
-                    for (key, value) in context.try_into_iter()? {
-                        generator_map_context.upsert_json_value(key, move |_current| value);
-                    }
-                }
-
-                // We return the final_bytes into our stream of response chunks
-                Ok(final_bytes)
-            }
-        });
-
-    // Create our response stream which consists of the bytes from our first body chained with the
-    // rest of the responses in our mapped stream.
-    let bytes = get_body_bytes(body).await.map_err(BoxError::from);
-    let final_stream = once(ready(bytes)).chain(mapped_stream).boxed();
-
-    // Finally, return a response which has a Body that wraps our stream of response chunks.
-    Ok(router::Response {
-        context,
-        response: http::Response::from_parts(
-            parts,
-            RouterBody::wrap_stream(final_stream).into_inner(),
-        ),
-    })
-}
-
-async fn process_supergraph_request_stage(
-    mut request: supergraph::Request,
-    wasm_engine: Arc<ArcSwap<Mutex<WasmEngine>>>,
-    sdl: Arc<String>,
-) -> Result<ControlFlow<supergraph::Response, supergraph::Request>, BoxError> {
-    let (parts, body) = request.supergraph_request.into_parts();
-    let bytes = Bytes::from(serde_json::to_vec(&body)?);
-    let body_to_send = serde_json::from_slice::<serde_json::Value>(&bytes)?;
-    let headers_to_send = externalize_header_map(&parts.headers)?;
-    let context_to_send = request.context.clone();
-    let sdl_to_send = sdl.clone().to_string();
-
-    let payload = json!({
-        "version": EXTERNALIZABLE_VERSION,
-        "stage": PipelineStep::RouterRequest,
-        "control": Control::default(),
-        "id": request.context.id.clone(),
-        "headers": headers_to_send,
-        "body": body_to_send,
-        "context": context_to_send,
-        "sdl": sdl_to_send,
-        "method": parts.method.to_string()
-    });
-    let payload_string = to_string(&payload).unwrap();
-
-    let wasm_instance = wasm_engine.load();
-    let mut locked_instance = wasm_instance.lock().await;
-    let plugin = &mut locked_instance.plugin;
-    let function_result = plugin.call::<&str, &str>("SupergraphRequest", &payload_string)?;
-
-    let returned_payload: RouterExtensionPayload<Value> = serde_json::from_str(function_result)?;
-    let control = returned_payload
-        .control
-        .expect("We should have validation similar to coprocessor");
-
-    if matches!(control, Control::Break(_)) {
-        let code = control.get_http_status()?;
-
-        let res = {
-            let graphql_response: crate::graphql::Response =
-                serde_json::from_value(returned_payload.body.unwrap_or(serde_json::Value::Null))
-                    .unwrap_or_else(|error| {
-                        crate::graphql::Response::builder()
-                            .errors(vec![Error::builder()
-                                .message(format!(
-                                    "couldn't deserialize coprocessor output body: {error}"
-                                ))
-                                .extension_code("EXTERNAL_DESERIALIZATION_ERROR")
-                                .build()])
-                            .build()
-                    });
-
-            let mut http_response = http::Response::builder()
-                .status(code)
-                .body(stream::once(future::ready(graphql_response)).boxed())?;
-            if let Some(headers) = returned_payload.headers {
-                *http_response.headers_mut() = internalize_header_map(headers)?;
-            }
-
-            let supergraph_response = supergraph::Response {
-                response: http_response,
-                context: request.context,
-            };
-
-            if let Some(context) = returned_payload.context {
-                for (key, value) in context.try_into_iter()? {
-                    supergraph_response
-                        .context
-                        .upsert_json_value(key, move |_current| value);
-                }
-            }
-
-            supergraph_response
-        };
-        return Ok(ControlFlow::Break(res));
-    }
-
-    let new_body: crate::graphql::Request = match returned_payload.body {
-        Some(value) => serde_json::from_value(value)?,
-        None => body,
-    };
-
-    request.supergraph_request = http::Request::from_parts(parts, new_body);
-
-    if let Some(context) = returned_payload.context {
-        for (key, value) in context.try_into_iter()? {
-            request
-                .context
-                .upsert_json_value(key, move |_current| value);
-        }
-    }
-
-    if let Some(headers) = returned_payload.headers {
-        *request.supergraph_request.headers_mut() = internalize_header_map(headers)?;
-    }
-
-    if let Some(uri) = returned_payload.uri {
-        *request.supergraph_request.uri_mut() = uri.parse()?;
-    }
-
-    return Ok(ControlFlow::Continue(request));
-}
-
-async fn process_supergraph_response_stage(
-    mut response: supergraph::Response,
-    wasm_engine: Arc<ArcSwap<Mutex<WasmEngine>>>,
-    sdl: Arc<String>,
-) -> Result<supergraph::Response, BoxError> {
-    let (mut parts, body) = response.response.into_parts();
-    let (first, rest): (Option<graphql::Response>, graphql::ResponseStream) =
-        body.into_future().await;
-
-    let first = first.ok_or_else(|| {
-        BoxError::from("Coprocessor cannot convert body into future due to problem with first part")
-    })?;
-
-    let body_to_send = serde_json::to_value(&first).expect("serialization will not fail");
-    let headers_to_send = externalize_header_map(&parts.headers)?;
-    let context_to_send = response.context.clone();
-    let sdl_to_send = sdl.clone().to_string();
-    let status_to_send = parts.status.as_u16();
-
-    let payload = json!({
-        "version": EXTERNALIZABLE_VERSION,
-        "stage": PipelineStep::RouterResponse,
-        "control": Control::default(),
-        "id": response.context.id.clone(),
-        "headers": headers_to_send,
-        "body": body_to_send,
-        "context": context_to_send,
-        "sdl": sdl_to_send,
-        "status": status_to_send,
-        "has_next": first.has_next
-    });
-    let payload_string = to_string(&payload).unwrap();
-
-    let wasm_instance = wasm_engine.load();
-    let mut locked_instance = wasm_instance.lock().await;
-    let plugin = &mut locked_instance.plugin;
-
-    let function_result = plugin.call::<&str, &str>("SupergraphResponse", &payload_string)?;
-    let returned_payload: RouterExtensionPayload<Value> = serde_json::from_str(function_result)?;
-
-    let new_body: graphql::Response = handle_graphql_response(first, returned_payload.body)?;
-
-    if let Some(control) = returned_payload.control {
-        parts.status = control.get_http_status()?
-    }
-
-    if let Some(context) = returned_payload.context {
-        for (key, value) in context.try_into_iter()? {
-            response
-                .context
-                .upsert_json_value(key, move |_current| value);
-        }
-    }
-
-    if let Some(headers) = returned_payload.headers {
-        parts.headers = internalize_header_map(headers)?;
-    }
-
-    // Clone all the bits we need
-    let context = response.context.clone();
-    let map_context = response.context.clone();
-
-    // Map the rest of our body to process subsequent chunks of response
-    let mapped_stream = rest
-        .then(move |deferred_response| {
-            //let generator_client = http_client.clone();
-            let generator_wasm_engine = wasm_engine.clone();
-            let generator_map_context = map_context.clone();
-            let generator_sdl_to_send = sdl_to_send.clone();
-            let generator_id = map_context.id.clone();
-
-            async move {
-                let body_to_send =
-                    serde_json::to_value(&deferred_response).expect("serialization will not fail");
-                let context_to_send = generator_map_context.clone();
-
-                // Note: We deliberately DO NOT send headers or status_code even if the user has
-                // requested them. That's because they are meaningless on a deferred response and
-                // providing them will be a source of confusion.
-                let payload = json!({
-                    "version": EXTERNALIZABLE_VERSION,
-                    "stage": PipelineStep::RouterResponse,
-                    "control": Control::default(),
-                    "id": generator_id,
-                    "body": body_to_send,
-                    "context": context_to_send,
-                    "sdl": generator_sdl_to_send,
-                    "has_next": deferred_response.has_next
-                });
-                let payload_string = to_string(&payload).unwrap();
-
-                let wasm_instance = generator_wasm_engine.load();
-                let mut locked_instance = wasm_instance.lock().await;
-                let plugin = &mut locked_instance.plugin;
-                let function_result =
-                    plugin.call::<&str, &str>("SupergraphResponse", &payload_string)?;
-
-                let returned_payload: RouterExtensionPayload<Value> =
-                    serde_json::from_str(function_result)?;
-
-                // Third, process our reply and act on the contents. Our processing logic is
-                // that we replace "bits" of our incoming response with the updated bits if they
-                // are present in our returned_payload. If they aren't present, just use the
-                // bits that we sent to the WASM plugin.
-                let new_deferred_response: graphql::Response =
-                    handle_graphql_response(deferred_response, returned_payload.body)?;
-
-                if let Some(context) = returned_payload.context {
-                    for (key, value) in context.try_into_iter()? {
-                        generator_map_context.upsert_json_value(key, move |_current| value);
-                    }
-                }
-
-                // We return the deferred_response into our stream of response chunks
-                Ok(new_deferred_response)
-            }
-        })
-        .map(|res: Result<graphql::Response, BoxError>| match res {
-            Ok(response) => response,
-            Err(e) => {
-                tracing::error!("WASM error handling deferred supergraph response: {e}");
-                graphql::Response::builder()
-                    .error(
-                        Error::builder()
-                            .message("Internal error handling deferred response")
-                            .extension_code("INTERNAL_ERROR")
-                            .build(),
-                    )
-                    .build()
-            }
-        });
-
-    // Create our response stream which consists of our first body chained with the
-    // rest of the responses in our mapped stream.
-    let stream = once(ready(new_body)).chain(mapped_stream).boxed();
-
-    // Finally, return a response which has a Body that wraps our stream of response chunks.
-    Ok(supergraph::Response {
-        context,
-        response: http::Response::from_parts(parts, stream),
-    })
 }
 
 register_plugin!("apollo", "wasm", Wasm);
