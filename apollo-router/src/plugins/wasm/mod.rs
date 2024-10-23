@@ -146,7 +146,8 @@ impl WasmEngine {
             path: full_main_path,
             meta: WasmMetadata::default(),
         };
-        let manifest = Manifest::new([wasm_file]);
+        // Allowing all hosts for now. In real life we may want to have them explicitly listed in the Router config, maybe. Or not.
+        let manifest = Manifest::new([wasm_file]).with_allowed_host("*");
         let plugin = extism::PluginBuilder::new(&manifest)
             .with_wasi(true)
             .with_function(
